@@ -108,6 +108,9 @@ type loginCtx struct {
 	deviceCode string
 	interval   int
 	expires    time.Time
+	client     *http.Client // isolated cookie jar for THIS flow — one login's
+	// WorkOS/Cline device cookies must never leak into the next login
+	// (upstream fingerprinting flags same-device registrations).
 }
 
 var (
@@ -119,6 +122,7 @@ var (
 	modelsSyncOnce sync.Once
 	clientOnce     sync.Once
 	sharedClient   *http.Client
+	accountClients sync.Map // accountKey -> *http.Client, per-account isolated cookie jar
 	gateMu         sync.Mutex
 	lastGateAt     time.Time
 )
@@ -546,6 +550,40 @@ func sharedHTTPClient() *http.Client {
 	return sharedClient
 }
 
+// newLoginClient builds an isolated client with its own cookie jar so one
+// login flow's WorkOS/Cline device cookies never leak into another.
+func newLoginClient() *http.Client {
+	jar, _ := cookiejar.New(nil)
+	return &http.Client{
+		Timeout:   sharedHTTPClient().Timeout,
+		Transport: sharedHTTPClient().Transport,
+		Jar:       jar,
+	}
+}
+
+// accountKey returns a stable per-account isolation key.
+func accountKey(sa *storedAuth) string {
+	return securityHash(accountUID(sa))
+}
+
+// accountHTTPClient returns a client whose cookie jar is isolated per
+// account. The transport (connection pool) is shared with the global
+// client, so per-account isolation costs nothing in connection reuse.
+func accountHTTPClient(sa *storedAuth) *http.Client {
+	key := accountKey(sa)
+	if existing, ok := accountClients.Load(key); ok {
+		return existing.(*http.Client)
+	}
+	jar, _ := cookiejar.New(nil)
+	client := &http.Client{
+		Timeout:   sharedHTTPClient().Timeout,
+		Transport: sharedHTTPClient().Transport,
+		Jar:       jar,
+	}
+	actual, _ := accountClients.LoadOrStore(key, client)
+	return actual.(*http.Client)
+}
+
 // gateUpstream serializes upstream chat calls with a minimum gap: the free
 // upstream channel returns empty responses under concurrency.
 func gateUpstream() {
@@ -636,7 +674,7 @@ func handleParseAuth(raw []byte) ([]byte, error) {
 
 // handleStartLogin starts a WorkOS device authorization flow.
 func handleStartLogin(raw []byte) ([]byte, error) {
-	client := sharedHTTPClient()
+	client := newLoginClient()
 	resp, err := postForm(client, workosDevice, url.Values{"client_id": {workosClientID}})
 	if err != nil {
 		return nil, fmt.Errorf("workos device: %w", err)
@@ -670,6 +708,7 @@ func handleStartLogin(raw []byte) ([]byte, error) {
 		deviceCode: dev.DeviceCode,
 		interval:   dev.Interval,
 		expires:    time.Now().Add(ttl),
+		client:     client,
 	})
 	return okEnvelope(pluginapi.AuthLoginStartResponse{
 		Provider:  providerName,
@@ -709,7 +748,10 @@ func handlePollLogin(raw []byte) ([]byte, error) {
 		loginStates.Delete(state)
 		return nil, fmt.Errorf("poll: login expired")
 	}
-	client := sharedHTTPClient()
+	client := lc.client
+	if client == nil {
+		client = sharedHTTPClient()
+	}
 	authResp, err := postForm(client, workosAuth, url.Values{
 		"grant_type":  {"urn:ietf:params:oauth:grant-type:device_code"},
 		"device_code": {lc.deviceCode},
@@ -802,7 +844,7 @@ func handleRefreshAuth(raw []byte) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("refresh: %w", err)
 	}
-	rawResp, err := postJSON(sharedHTTPClient(), clineRefresh, map[string]any{
+	rawResp, err := postJSON(accountHTTPClient(sa), clineRefresh, map[string]any{
 		"refreshToken": sa.Auth.RefreshToken,
 		"grantType":    "refresh_token",
 	})
@@ -957,7 +999,7 @@ func upstreamChat(sa *storedAuth, body []byte, taskID string) (*http.Response, e
 	gateUpstream()
 	// Refresh access token if we don't have one or it's expired.
 	if sa.Auth.AccessToken == "" || time.Now().UnixMilli() >= sa.Auth.ExpiresAt {
-		rawResp, err := postJSON(sharedHTTPClient(), clineRefresh, map[string]any{
+		rawResp, err := postJSON(accountHTTPClient(sa), clineRefresh, map[string]any{
 			"refreshToken": sa.Auth.RefreshToken,
 			"grantType":    "refresh_token",
 		})
@@ -986,7 +1028,7 @@ func upstreamChat(sa *storedAuth, body []byte, taskID string) (*http.Response, e
 			req.Header.Add(k, v)
 		}
 	}
-	resp, err := sharedHTTPClient().Do(req)
+	resp, err := accountHTTPClient(sa).Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("http_error: %w", err)
 	}
