@@ -1,0 +1,8 @@
+# build artifacts
+*.so
+*.dll
+*.dylib
+cline.h
+
+# local backup
+.update-backup/
