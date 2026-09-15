@@ -389,7 +389,8 @@ func clineRegistration() registration {
 			Name:             providerName,
 			Version:          "1.0.0",
 			Author:           "BevalZ (protocol from pingmike2/cline2api-workers)",
-			GitHubRepository: "https://github.com/BevalZ/workbuddy-proxy",
+			GitHubRepository: "https://github.com/BevalZ/cline-cliproxy",
+			Logo:             "data:image/png;base64," + clineLogoData,
 		},
 		Capabilities: registrationCapability{
 			ModelProvider:         true,
