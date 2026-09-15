@@ -11,8 +11,8 @@ Cline 上游的免费模型。
 | 能力 | 说明 |
 |---|---|
 | 登录方式 | WorkOS 设备授权流（浏览器打开链接 → Google/GitHub/邮箱登录 → 自动完成，无需手工粘 token） |
-| 模型策略 | **仅免费模型**（`:free` 后缀 + `deepseek/deepseek-v4-flash` 白名单）；`cline-pass/*` 订阅付费、`zai/glm-5.2` 按次付费全部屏蔽 |
-| 模型同步 | 动态拉取上游 `/v1/models`（30 分钟刷新）+ 内置回退表 |
+| 模型策略 | **仅 Cline 官方免费模型**（同步 `recommended-models` 的 `free` 数组，非 `/v1/models`）；付费通道（cline-pass/* 等）全部不暴露 |
+| 模型同步 | 动态拉取上游 `recommended-models` 的 `free` 数组（30 分钟刷新）+ 内置回退表 |
 | 账号隔离 | 每个账号按邮箱 hash 独立凭证文件（`cline-<hash>.json`），多账号互不覆盖 |
 | 额度轮换 | 429 / 空响应自动解析冷却时长（如 `Try again in 2h 51m`，上限 6h）并切号重试 |
 | 免费通道适配 | 非流式请求强制上游流式再聚合；全局串行 + 800ms 间隔防并发空响应 |
@@ -50,11 +50,15 @@ go build -buildmode=c-shared -o cline.so .
 浏览器打开 WorkOS 授权链接登录 → 凭证自动落盘 `~/.cli-proxy-api/cline-<hash>.json`。
 多账号各自独立文件，429 冷却自动切换。
 
-## 可用模型（免费）
+## 可用模型（Cline 官方免费，同步自 recommended-models）
 
-- `deepseek/deepseek-v4-flash`（默认，每日免费额度，用完 429 提示冷却时间）
+- `cline-free/deepseek-v4.1-flash`（1M 上下文，最快）
+- `cline-free/muse-spark-1.3-contributor`
+- `cline-free/solar-pro4`
+- `z-ai/glm-5.3-flash`
 - `poolside/laguna-s-2.1:free`
-- 上游 `/v1/models` 中所有 `:free` 后缀模型（动态同步自动收录）
+
+> 上游新增/下架免费模型时自动跟随（每 30 分钟同步一次）。
 
 ## 关联项目
 

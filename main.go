@@ -85,6 +85,10 @@ const (
 	clineRefresh   = clineAPIBase + "/auth/refresh"
 	clineModels    = clineAPIBase + "/models"
 	clineChat      = clineAPIBase + "/chat/completions"
+	// The authoritative free-model catalog — NOT /v1/models (which lists 400+
+	// models across all tiers). The `free` array here is Cline's own
+	// definition of what a free account can call.
+	clineRecommended = clineAPIBase + "/ai/cline/recommended-models"
 	workosClientID = "client_01K3A541FN8TA3EPPHTD2325AR"
 
 	// The free upstream channel (deepseek/*, :free models) breaks under
@@ -119,38 +123,23 @@ var (
 	lastGateAt     time.Time
 )
 
-// isFreeModel reports whether an upstream model id is on the free tier.
-// Paid channels (cline-pass/* subscription models, zai/glm-5.2 per-use) are
-// deliberately blocked — only free models are exposed to clients.
-func isFreeModel(id string) bool {
-	if strings.HasSuffix(id, ":free") {
-		return true
-	}
-	switch id {
-	case "deepseek/deepseek-v4-flash", "zai/glm-5.3-flash":
-		return true
-	}
-	return false
-}
-
-// fallbackModels mirrors the cline2api-workers built-in list, free tier only.
+// fallbackModels mirrors the authoritative recommended-models `free` catalog.
 func fallbackModels() []pluginapi.ModelInfo {
-	ids := []string{
-		"deepseek/deepseek-v4-flash",
-		"poolside/laguna-s-2.1:free",
-		"zai/glm-5.3-flash",
+	free := []recommendedModel{
+		{ID: "cline-free/deepseek-v4.1-flash", Name: "Deepseek-v4.1-Flash"},
+		{ID: "cline-free/muse-spark-1.3-contributor", Name: "Muse Spark 1.3 Contributor"},
+		{ID: "z-ai/glm-5.3-flash", Name: "glm-5.3-flash"},
+		{ID: "cline-free/solar-pro4", Name: "Solar Pro 4"},
+		{ID: "poolside/laguna-s-2.1:free", Name: "laguna-s-2.1:free"},
 	}
-	out := make([]pluginapi.ModelInfo, 0, len(ids))
-	for _, id := range ids {
-		if !isFreeModel(id) {
-			continue
-		}
+	out := make([]pluginapi.ModelInfo, 0, len(free))
+	for _, m := range free {
 		out = append(out, pluginapi.ModelInfo{
-			ID:          id,
+			ID:          m.ID,
 			Object:      "model",
 			OwnedBy:     "cline",
-			Name:        id,
-			DisplayName: id,
+			Name:        m.ID,
+			DisplayName: m.Name,
 			Type:        "chat",
 		})
 	}
@@ -182,36 +171,46 @@ func modelsSyncLoop() {
 	})
 }
 
-type modelsResponse struct {
-	Data []struct {
-		ID string `json:"id"`
-	} `json:"data"`
+type recommendedModelsResponse struct {
+	Recommended []recommendedModel `json:"recommended"`
+	Free        []recommendedModel `json:"free"`
+	ClinePass   []recommendedModel `json:"clinePass"`
+	ClineCloud  []recommendedModel `json:"clineCloud"`
+}
+
+type recommendedModel struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
 }
 
 func refreshModels() {
-	req, err := http.NewRequest(http.MethodGet, clineModels, nil)
+	req, err := http.NewRequest(http.MethodGet, clineRecommended, nil)
 	if err != nil {
+		fmt.Printf("[cline] models fetch setup error: %v\n", err)
 		return
 	}
 	req.Header.Set("User-Agent", "Mozilla/5.0 (cline2api)")
 	client := sharedHTTPClient()
 	resp, err := client.Do(req)
 	if err != nil {
+		fmt.Printf("[cline] models fetch error: %v\n", err)
 		return
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
+		fmt.Printf("[cline] models fetch HTTP %d\n", resp.StatusCode)
 		return
 	}
 	raw, _ := io.ReadAll(resp.Body)
-	var mr modelsResponse
-	if json.Unmarshal(raw, &mr) != nil || len(mr.Data) == 0 {
+	var mr recommendedModelsResponse
+	if json.Unmarshal(raw, &mr) != nil || len(mr.Free) == 0 {
+		fmt.Printf("[cline] models fetch parse error (bytes=%d)\n", len(raw))
 		return
 	}
-	list := make([]pluginapi.ModelInfo, 0, len(mr.Data))
-	for _, m := range mr.Data {
-		id := m.ID
-		if id == "" || !isFreeModel(id) {
+	list := make([]pluginapi.ModelInfo, 0, len(mr.Free))
+	for _, m := range mr.Free {
+		id := strings.TrimSpace(m.ID)
+		if id == "" {
 			continue
 		}
 		list = append(list, pluginapi.ModelInfo{
@@ -219,7 +218,7 @@ func refreshModels() {
 			Object:      "model",
 			OwnedBy:     "cline",
 			Name:        id,
-			DisplayName: id,
+			DisplayName: firstNonEmpty(m.Name, id),
 			Type:        "chat",
 		})
 	}
@@ -230,6 +229,22 @@ func refreshModels() {
 }
 
 func currentModels() []pluginapi.ModelInfo {
+	if m := cachedModels(); len(m) > 0 {
+		return m
+	}
+	// Registration raced the background sync (CPA asks for models before the
+	// init goroutine finishes the first upstream fetch). Do one synchronous
+	// refresh with a bounded wait so the real free catalog is registered;
+	// fall back to the built-in list only if the upstream is unreachable.
+	done := make(chan struct{})
+	go func() {
+		refreshModels()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(8 * time.Second):
+	}
 	if m := cachedModels(); len(m) > 0 {
 		return m
 	}
